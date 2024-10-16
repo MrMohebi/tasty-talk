@@ -195,6 +195,8 @@ func main() {
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("ok userAddress"))
 		case "userAddresses":
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("addresses  of " + chatId.String()))
+		case "userContacts":
+			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("contacts  of " + chatId.String()))
 		default:
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("no query found!"))
 		}
