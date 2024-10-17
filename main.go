@@ -1,14 +1,18 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"
 	tu "github.com/mymmrac/telego/telegoutil"
 	"io/ioutil"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,6 +20,31 @@ import (
 	"strconv"
 	"strings"
 )
+
+type User struct {
+	TelegramId  int64
+	Phone       sql.NullString
+	Username    sql.NullString
+	Addresses   sql.NullString
+	Contacts    sql.NullString
+	CreatedAt   sql.NullTime
+	lastOrderAt sql.NullTime
+}
+
+type Address struct {
+	Id        int32
+	Latitude  float64
+	Longitude float64
+	TextAuto  string
+	Text      string
+	Title     string
+}
+
+type Contact struct {
+	Firstname string
+	Lastname  string
+	phone     string
+}
 
 func main() {
 	err := godotenv.Load()
@@ -25,6 +54,17 @@ func main() {
 
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	adminID := chatID(os.Getenv("ADMIN_ID"))
+
+	db, err := sql.Open("sqlite3", "./db.sqlite3")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("create table if not exists users (telegram_id INTEGER not null,phone TEXT, username TEXT, addresses TEXT, contacts TEXT, created_at TIMESTAMP default CURRENT_TIMESTAMP not null, last_order_at TIMESTAMP, CONSTRAINT `telegram_id_UNIQUE` PRIMARY KEY (telegram_id) );")
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	bot, err := telego.NewBot(botToken, telego.WithDefaultDebugLogger())
 	if err != nil {
@@ -44,6 +84,23 @@ func main() {
 
 	bh, _ := th.NewBotHandler(bot, updates)
 
+	// Register handler with match on command `/start`
+	bh.Handle(func(bot *telego.Bot, update telego.Update) {
+		var user User
+		user.TelegramId = update.Message.From.ID
+		user.Username = sql.NullString{String: update.Message.From.Username}
+
+		err = insertUser(db, &user)
+		if err != nil {
+			println(err)
+		}
+		// Send message
+		_, _ = bot.SendMessage(tu.Messagef(
+			tu.ID(update.Message.Chat.ID),
+			"Hello %s!", update.Message.From.FirstName,
+		))
+	}, th.CommandEqual("start"))
+
 	// user chat location handler
 	bh.Handle(func(bot *telego.Bot, update telego.Update) {
 		chatID := tu.ID(update.Message.Chat.ID)
@@ -52,6 +109,18 @@ func main() {
 		address, err := locationAddress(message.Location.Latitude, message.Location.Longitude)
 		if err != nil {
 			println(err)
+		}
+
+		addr := Address{Id: rune(randNumber(5)), Text: address, TextAuto: address, Latitude: message.Location.Latitude, Longitude: message.Location.Longitude}
+		var user User
+		if err := getUser(db, &user, message.From.ID); err != nil {
+			println(err)
+			return
+		}
+
+		if err := addAddressToUser(db, &user, addr); err != nil {
+			println(err)
+			return
 		}
 
 		_, _ = bot.SendMessage(tu.Message(chatID, "آدرس: "+address+"\n\n"+"ثبت شد").WithReplyMarkup(tu.ReplyKeyboardRemove()))
@@ -90,8 +159,8 @@ func main() {
 				tu.InlineKeyboardButton("د شماره").WithCallbackData("phone_"+chatID.String()),
 			),
 			tu.InlineKeyboardRow( // Row 1
-				tu.InlineKeyboardButton("ادرس ها").WithCallbackData("userAddresses_"+strconv.FormatInt(message.From.ID, 64)),
-				tu.InlineKeyboardButton("شماره ها").WithCallbackData("userContacts_"+strconv.FormatInt(message.From.ID, 64)),
+				tu.InlineKeyboardButton("ادرس ها").WithCallbackData("userAddresses_"+strconv.FormatInt(message.From.ID, 10)),
+				tu.InlineKeyboardButton("شماره ها").WithCallbackData("userContacts_"+strconv.FormatInt(message.From.ID, 10)),
 			),
 		)
 
@@ -166,12 +235,28 @@ func main() {
 
 		switch action {
 		case "location":
-			inlineKeyboard := tu.InlineKeyboard(
-				tu.InlineKeyboardRow(
-					tu.InlineKeyboardButton("عنوان ادرس یک").WithCallbackData("userAddress_"+chatId.String()+"_1"),
-					tu.InlineKeyboardButton("عنوان ادرس دو").WithCallbackData("userAddress_"+chatId.String()+"_2"),
-				),
-			)
+			var user User
+			if err := getUser(db, &user, query.From.ID); err != nil {
+				println(err)
+				_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("err!"))
+			}
+
+			address := parseAddresses(user.Addresses.String)
+
+			addressesLen := len(address)
+			sliceLen := 2
+			items := int(math.Ceil(float64(addressesLen / sliceLen)))
+			inlineKeyboardRows := make([][]telego.InlineKeyboardButton, items)
+			for i := 1; i <= items; i++ {
+				inlineKeyboardRows[i-1] = make([]telego.InlineKeyboardButton, sliceLen)
+				for j := 1; j <= sliceLen; j++ {
+					x := (i * j) - 1
+					inlineKeyboardRows[i-1][j-1] = tu.InlineKeyboardButton(address[x].Text).WithCallbackData("userAddress_" + chatId.String() + "_" + StringInt32(address[x].Id))
+				}
+			}
+
+			inlineKeyboard := tu.InlineKeyboard(inlineKeyboardRows...)
+
 			keyboard := tu.Keyboard(
 				tu.KeyboardRow( // Row 1
 					tu.KeyboardButton("ارسال موقعیت مکانی فعلی").WithRequestLocation(),
@@ -280,4 +365,102 @@ func extractIDFromMessage(text string) telego.ChatID {
 	}
 
 	return chatID(id)
+}
+
+func insertUser(db *sql.DB, user *User) error {
+	stmt, err := db.Prepare("INSERT OR IGNORE INTO users(telegram_id, username) VALUES(?, ?);")
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+	_, err = stmt.Exec(user.TelegramId, user.Username)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func getUser(db *sql.DB, user *User, telegramId int64) error {
+	stmt, err := db.Prepare("select * from users where telegram_id = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	err = stmt.QueryRow(telegramId).Scan(&user.TelegramId, &user.Phone, &user.Username, &user.Addresses, &user.Contacts, &user.CreatedAt, &user.lastOrderAt)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseAddresses(address string) []Address {
+	var data []Address
+	if address != "" && len(address) > 1 {
+		err := json.Unmarshal([]byte(address), &data)
+		if err != nil {
+			println(err)
+			return nil
+		}
+	}
+	return data
+}
+
+func addAddressToUser(db *sql.DB, user *User, address Address) error {
+	stmt, err := db.Prepare("UPDATE users SET addresses = ? WHERE telegram_id = ?")
+	if err != nil {
+		return err
+	}
+	var addresses []Address
+	if user.Addresses.Valid && len(user.Addresses.String) > 2 {
+		addresses = parseAddresses(user.Addresses.String)
+	}
+
+	addresses = append(addresses, address)
+
+	data, err := json.Marshal(addresses)
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+	_, err = stmt.Exec(data, user.TelegramId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func randNumber(n int) int {
+
+	minLimit := int(math.Pow10(n))
+	maxLimit := int(math.Pow10(n - 1))
+	randInt := int(rand.Float64() * float64(minLimit))
+	if randInt < maxLimit {
+		randInt += maxLimit
+	}
+	return randInt
+
+}
+func StringInt32(n int32) string {
+	buf := [11]byte{}
+	pos := len(buf)
+	i := int64(n)
+	signed := i < 0
+	if signed {
+		i = -i
+	}
+	for {
+		pos--
+		buf[pos], i = '0'+byte(i%10), i/10
+		if i == 0 {
+			if signed {
+				pos--
+				buf[pos] = '-'
+			}
+			return string(buf[pos:])
+		}
+	}
 }
