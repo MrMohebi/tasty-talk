@@ -125,6 +125,19 @@ func main() {
 
 		_, _ = bot.SendMessage(tu.Message(chatID, "آدرس: "+address+"\n\n"+"ثبت شد").WithReplyMarkup(tu.ReplyKeyboardRemove()))
 
+		inlineKeyboard := tu.InlineKeyboard(
+			tu.InlineKeyboardRow(
+				tu.InlineKeyboardButton("د موقعیت").WithCallbackData("location_"+chatID.String()),
+				tu.InlineKeyboardButton("د شماره").WithCallbackData("phone_"+chatID.String()),
+			),
+			tu.InlineKeyboardRow( // Row 1
+				tu.InlineKeyboardButton("ادرس ها").WithCallbackData("userAddresses_"+strconv.FormatInt(message.From.ID, 10)),
+				tu.InlineKeyboardButton("شماره ها").WithCallbackData("userContacts_"+strconv.FormatInt(message.From.ID, 10)),
+			),
+		)
+		entries := []tu.MessageEntityCollection{tu.Entity("آدرس جدیدی ثبت کرد"), tu.Entity("\n"), tu.Entity("#id_" + chatID.String()).Hashtag()}
+		_, _ = bot.SendMessage(tu.MessageWithEntities(adminID, entries...).WithReplyMarkup(inlineKeyboard))
+
 	},
 		th.AnyMessage(),
 		func(update telego.Update) bool {
@@ -243,22 +256,12 @@ func main() {
 
 			address := parseAddresses(user.Addresses.String)
 
-			addressesLen := len(address)
-			sliceLen := 2
-			items := int(math.Ceil(float64(addressesLen / sliceLen)))
-			inlineKeyboardRows := make([][]telego.InlineKeyboardButton, items)
-			for i := 1; i <= items; i++ {
-				inlineKeyboardRows[i-1] = make([]telego.InlineKeyboardButton, sliceLen)
-				for j := 1; j <= sliceLen; j++ {
-					x := (i * j) - 1
-					inlineKeyboardRows[i-1][j-1] = tu.InlineKeyboardButton(address[x].Text).WithCallbackData("userAddress_" + chatId.String() + "_" + StringInt32(address[x].Id))
-				}
-			}
+			inlineKeyboardRows := userAddressesAsInlineButtons(address, chatId, "userAddress")
 
 			inlineKeyboard := tu.InlineKeyboard(inlineKeyboardRows...)
 
 			keyboard := tu.Keyboard(
-				tu.KeyboardRow( // Row 1
+				tu.KeyboardRow(
 					tu.KeyboardButton("ارسال موقعیت مکانی فعلی").WithRequestLocation(),
 				),
 			).WithResizeKeyboard().WithOneTimeKeyboard()
@@ -279,6 +282,16 @@ func main() {
 		case "userAddress":
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("ok userAddress"))
 		case "userAddresses":
+			var user User
+			if err := getUser(db, &user, query.From.ID); err != nil {
+				println(err)
+				_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("err!"))
+			}
+			addresses := parseAddresses(user.Addresses.String)
+			for _, addr := range addresses {
+				m, _ := bot.SendLocation(tu.Location(adminID, addr.Latitude, addr.Longitude).WithReplyParameters(&telego.ReplyParameters{MessageID: query.Message.GetMessageID()}))
+				bot.SendMessage(tu.Message(adminID, addr.Text).WithReplyParameters(&telego.ReplyParameters{MessageID: m.MessageID}))
+			}
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("addresses  of " + chatId.String()))
 		case "userContacts":
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("contacts  of " + chatId.String()))
@@ -431,6 +444,26 @@ func addAddressToUser(db *sql.DB, user *User, address Address) error {
 		return err
 	}
 	return nil
+}
+
+func userAddressesAsInlineButtons(addresses []Address, chatId telego.ChatID, action string) [][]telego.InlineKeyboardButton {
+	addressesLen := len(addresses)
+	sliceLen := 2
+	items := int(math.Ceil(float64(addressesLen / sliceLen)))
+	inlineKeyboardRows := make([][]telego.InlineKeyboardButton, items)
+	for i := 1; i <= items; i++ {
+		inlineKeyboardRows[i-1] = make([]telego.InlineKeyboardButton, sliceLen)
+		for j := 1; j <= sliceLen; j++ {
+			x := (i * j) - 1
+			text := addresses[x].Text
+			if len(addresses[x].Text) > 50 {
+				text = addresses[x].Text[:50]
+			}
+			inlineKeyboardRows[i-1][j-1] = tu.InlineKeyboardButton(text).WithCallbackData(action + "_" + chatId.String() + "_" + StringInt32(addresses[x].Id))
+		}
+	}
+
+	return inlineKeyboardRows
 }
 
 func randNumber(n int) int {
