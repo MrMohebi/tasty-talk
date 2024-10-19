@@ -41,9 +41,11 @@ type Address struct {
 }
 
 type Contact struct {
+	Id        int32
+	Name      string
 	Firstname string
 	Lastname  string
-	phone     string
+	Phone     string
 }
 
 func main() {
@@ -151,6 +153,17 @@ func main() {
 		chatID := tu.ID(update.Message.Chat.ID)
 		message := update.Message
 
+		contact := Contact{Id: rune(randNumber(5)), Firstname: message.Contact.FirstName, Lastname: message.Contact.LastName, Name: "", Phone: message.Contact.PhoneNumber}
+		var user User
+		if err := getUser(db, &user, message.From.ID); err != nil {
+			println(err)
+			return
+		}
+		if err := addContactToUser(db, &user, contact); err != nil {
+			println(err)
+			return
+		}
+
 		_, _ = bot.SendMessage(tu.Message(chatID, "مخاطب: "+message.Contact.FirstName+" "+message.Contact.LastName+"\n\n"+"ثبت شد").WithReplyMarkup(tu.ReplyKeyboardRemove()))
 
 	},
@@ -239,12 +252,12 @@ func main() {
 		queryKeys := strings.Split(query.Data, "_")
 		action := queryKeys[0]
 		chatId := chatID(queryKeys[1])
-		addressId := ""
-		if len(queryKeys) > 2 {
-			addressId = queryKeys[2]
-		}
 
-		println(addressId)
+		var addressId int32
+		if len(queryKeys) > 2 {
+			ad, _ := strconv.ParseInt(queryKeys[2], 10, 32)
+			addressId = int32(ad)
+		}
 
 		switch action {
 		case "location":
@@ -280,20 +293,50 @@ func main() {
 
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("phone request sent!"))
 		case "userAddress":
-			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("ok userAddress"))
+			var user User
+			if err := getUser(db, &user, query.From.ID); err != nil {
+				println(err)
+				_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("err!"))
+			}
+
+			addresses := parseAddresses(user.Addresses.String)
+
+			var selected Address
+			for _, item := range addresses {
+				if item.Id == addressId {
+					selected = item
+				}
+			}
+
+			entries := []tu.MessageEntityCollection{tu.Entity("آدرس انتخاب شده کابر"), tu.Entity("\n"), tu.Entity(selected.Text), tu.Entity("\n"), tu.Entity("#id_" + strconv.FormatInt(query.From.ID, 10)).Hashtag()}
+
+			m, _ := bot.SendLocation(tu.Location(adminID, selected.Latitude, selected.Longitude))
+			_, _ = bot.SendMessage(tu.MessageWithEntities(adminID, entries...).WithReplyParameters(&telego.ReplyParameters{MessageID: m.MessageID}))
+
+			_, _ = bot.SendMessage(tu.Messagef(tu.ID(query.From.ID), "ادرس %s. با موفقیت ثبت شد", selected.Text).WithReplyMarkup(tu.ReplyKeyboardRemove()))
+			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("ثبت شد"))
 		case "userAddresses":
 			var user User
 			if err := getUser(db, &user, query.From.ID); err != nil {
 				println(err)
 				_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("err!"))
 			}
-			addresses := parseAddresses(user.Addresses.String)
-			for _, addr := range addresses {
-				m, _ := bot.SendLocation(tu.Location(adminID, addr.Latitude, addr.Longitude).WithReplyParameters(&telego.ReplyParameters{MessageID: query.Message.GetMessageID()}))
-				bot.SendMessage(tu.Message(adminID, addr.Text).WithReplyParameters(&telego.ReplyParameters{MessageID: m.MessageID}))
+			data := parseAddresses(user.Addresses.String)
+			for _, item := range data {
+				m, _ := bot.SendLocation(tu.Location(adminID, item.Latitude, item.Longitude).WithReplyParameters(&telego.ReplyParameters{MessageID: query.Message.GetMessageID()}))
+				_, _ = bot.SendMessage(tu.Message(adminID, item.Text).WithReplyParameters(&telego.ReplyParameters{MessageID: m.MessageID}))
 			}
-			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("addresses  of " + chatId.String()))
+			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("addresses of " + chatId.String()))
 		case "userContacts":
+			var user User
+			if err := getUser(db, &user, query.From.ID); err != nil {
+				println(err)
+				_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("err!"))
+			}
+			data := parseContacts(user.Contacts.String)
+			for _, item := range data {
+				_, _ = bot.SendContact(tu.Contact(adminID, item.Phone, item.Firstname).WithReplyParameters(&telego.ReplyParameters{MessageID: query.Message.GetMessageID()}))
+			}
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("contacts  of " + chatId.String()))
 		default:
 			_ = bot.AnswerCallbackQuery(tu.CallbackQuery(query.ID).WithText("no query found!"))
@@ -421,6 +464,18 @@ func parseAddresses(address string) []Address {
 	return data
 }
 
+func parseContacts(contact string) []Contact {
+	var data []Contact
+	if contact != "" && len(contact) > 1 {
+		err := json.Unmarshal([]byte(contact), &data)
+		if err != nil {
+			println(err)
+			return nil
+		}
+	}
+	return data
+}
+
 func addAddressToUser(db *sql.DB, user *User, address Address) error {
 	stmt, err := db.Prepare("UPDATE users SET addresses = ? WHERE telegram_id = ?")
 	if err != nil {
@@ -434,6 +489,31 @@ func addAddressToUser(db *sql.DB, user *User, address Address) error {
 	addresses = append(addresses, address)
 
 	data, err := json.Marshal(addresses)
+	if err != nil {
+		return err
+	}
+
+	defer stmt.Close()
+	_, err = stmt.Exec(data, user.TelegramId)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func addContactToUser(db *sql.DB, user *User, contact Contact) error {
+	stmt, err := db.Prepare("UPDATE users SET contacts = ? WHERE telegram_id = ?")
+	if err != nil {
+		return err
+	}
+	var contacts []Contact
+	if user.Contacts.Valid && len(user.Contacts.String) > 2 {
+		contacts = parseContacts(user.Contacts.String)
+	}
+
+	contacts = append(contacts, contact)
+
+	data, err := json.Marshal(contacts)
 	if err != nil {
 		return err
 	}
